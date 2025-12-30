@@ -75,19 +75,15 @@ class SingleLSTM(nn.Module):
         
         # Dropout layer
         self.dropout_layer = nn.Dropout(dropout)
-        
         # Fully connected output layer
-        fc_input_size = hidden_size_2 * self.num_directions
-        self.fc = nn.Linear(fc_input_size, 1)
-        
-        # Sigmoid for probability output
-        self.sigmoid = nn.Sigmoid()
+        self.fc = nn.Linear(hidden_size_2 * self.num_directions, 1)
+        # Note: No Sigmoid here. We output logits for use with BCEWithLogitsLoss
         
         # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize LSTM and FC weights."""
+        """Initialize weights to help convergence."""
         for name, param in self.named_parameters():
             if 'weight_ih' in name:
                 nn.init.xavier_uniform_(param.data)
@@ -95,9 +91,10 @@ class SingleLSTM(nn.Module):
                 nn.init.orthogonal_(param.data)
             elif 'bias' in name:
                 param.data.fill_(0)
-                # Set forget gate bias to 1 (helps with gradient flow)
+                # Initialize forget gate bias to 1 to remember long-term dependencies
                 n = param.size(0)
-                param.data[n//4:n//2].fill_(1.0)
+                start, end = n//4, n//2
+                param.data[start:end].fill_(1.0)
             elif 'weight' in name:
                 nn.init.xavier_uniform_(param.data)
     
@@ -106,10 +103,10 @@ class SingleLSTM(nn.Module):
         Forward pass.
         
         Args:
-            x: Input tensor of shape (batch_size, seq_len, input_size)
+            x: Input tensor (batch_size, seq_len, input_size)
         
         Returns:
-            Probabilities of shape (batch_size,) in range [0, 1]
+            Logits of shape (batch_size,)
         """
         batch_size = x.size(0)
         
@@ -132,27 +129,16 @@ class SingleLSTM(nn.Module):
         h_final = self.dropout_layer(h_final)
         
         # Fully connected layer
-        output = self.fc(h_final)
+        logit = self.fc(h_final)
         
-        # Sigmoid for probability
-        prob = self.sigmoid(output)
-        
-        return prob.squeeze(-1)
+        return logit.squeeze(-1)
     
     def predict(self, x: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
-        """
-        Make binary predictions.
-        
-        Args:
-            x: Input tensor
-            threshold: Probability threshold for class 1
-        
-        Returns:
-            Binary predictions (0 or 1)
-        """
+        """Make binary predictions."""
         self.eval()
         with torch.no_grad():
-            probs = self.forward(x)
+            logits = self.forward(x)
+            probs = torch.sigmoid(logits)
             predictions = (probs >= threshold).long()
         return predictions
     
@@ -200,11 +186,12 @@ def train_single_lstm(model: SingleLSTM,
     """
     model = model.to(device)
     
-    # Loss function with optional class weighting
+    # Use BCEWithLogitsLoss for numerical stability
     if class_weight is not None:
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weight]).to(device))
+        pos_weight = torch.tensor([class_weight]).to(device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     else:
-        criterion = nn.BCELoss()
+        criterion = nn.BCEWithLogitsLoss()
     
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -237,13 +224,18 @@ def train_single_lstm(model: SingleLSTM,
             
             outputs = model(sequences)
             loss = criterion(outputs, targets)
+            logits = model(sequences)
+            loss = criterion(logits, targets)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item() * sequences.size(0)
-            predictions = (outputs >= 0.5).long()
+            
+            # Apply sigmoid for accuracy calculation
+            probs = torch.sigmoid(logits)
+            predictions = (probs >= 0.5).long()
             train_correct += (predictions == targets.long()).sum().item()
             train_total += targets.size(0)
         
@@ -268,13 +260,14 @@ def train_single_lstm(model: SingleLSTM,
                 sequences = sequences.to(device)
                 targets = targets.to(device)
                 
-                outputs = model(sequences)
-                loss = criterion(outputs, targets)
+                logits = model(sequences)
+                loss = criterion(logits, targets)
+                val_loss += loss.item() * len(targets)
                 
-                val_loss += loss.item() * sequences.size(0)
-                predictions = (outputs >= 0.5).long()
-                val_correct += (predictions == targets.long()).sum().item()
-                val_total += targets.size(0)
+                probs = torch.sigmoid(logits)
+                preds = (probs >= 0.5).long()
+                val_correct += (preds == targets.long()).sum().item()
+                val_total += len(targets) # Corrected from len(targets).size(0)
         
         val_loss /= val_total
         val_acc = val_correct / val_total

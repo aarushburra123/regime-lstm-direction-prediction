@@ -277,11 +277,21 @@ class MixtureOfExpertsModel(nn.Module):
         w_low = weights[:, 0]
         w_high = weights[:, 1]
         
-        # Weighted combination of logits
-        combined_logit = w_low * low_vol_logit + w_high * high_vol_logit
+        # Weighted combination of logits (approximate MoE logic for logits)
+        # Proper way: Combined prob = sum(w_i * prob_i)
+        # But we want to return LOGITS.
+        # Logit(p) is non-linear.
+        # Option 1: Return probs (and change loss function to BCELoss - risky)
+        # Option 2: Return linear combination of logits (heuristic, but works with BCEWithLogitsLoss)
+        # Option 3: Calculate probs, then inverse sigmoid to get logit? Unstable.
         
-        # Sigmoid for probability
-        prob = self.sigmoid(combined_logit)
+        # We will use Option 2 (Weighted Logits) for training stability, 
+        # or stick to Option 1 (Probs) but use BCELoss.
+        
+        # User REQ: "outputs are LOGITS" and "Use BCEWithLogitsLoss".
+        # So we return combined_logit.
+        
+        combined_logit = w_low * low_vol_logit + w_high * high_vol_logit
         
         if return_expert_outputs:
             expert_info = {
@@ -293,15 +303,16 @@ class MixtureOfExpertsModel(nn.Module):
                 'w_low': w_low,
                 'w_high': w_high
             }
-            return prob, expert_info
+            return combined_logit, expert_info
         
-        return prob
+        return combined_logit
     
     def predict(self, x: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
         """Make binary predictions."""
         self.eval()
         with torch.no_grad():
-            probs = self.forward(x)
+            logits = self.forward(x)
+            probs = self.sigmoid(logits)
             predictions = (probs >= threshold).long()
         return predictions
     
@@ -309,7 +320,8 @@ class MixtureOfExpertsModel(nn.Module):
         """Get probability predictions."""
         self.eval()
         with torch.no_grad():
-            probs = self.forward(x)
+            logits = self.forward(x)
+            probs = self.sigmoid(logits)
         return probs
     
     def freeze_experts(self):
@@ -462,7 +474,7 @@ def train_moe_phase2(model: MixtureOfExpertsModel,
     model = model.to(device)
     model.freeze_experts()
     
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.gating.parameters(), lr=learning_rate)
     
     train_losses, val_losses = [], []
@@ -482,8 +494,8 @@ def train_moe_phase2(model: MixtureOfExpertsModel,
             targets = targets.to(device)
             
             optimizer.zero_grad()
-            probs = model(sequences)
-            loss = criterion(probs, targets)
+            logits = model(sequences)
+            loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
             
@@ -505,8 +517,8 @@ def train_moe_phase2(model: MixtureOfExpertsModel,
                 sequences = sequences.to(device)
                 targets = targets.to(device)
                 
-                probs = model(sequences)
-                loss = criterion(probs, targets)
+                logits = model(sequences)
+                loss = criterion(logits, targets)
                 val_loss += loss.item() * len(targets)
                 val_total += len(targets)
         
@@ -551,7 +563,7 @@ def train_moe_phase3(model: MixtureOfExpertsModel,
     model = model.to(device)
     model.unfreeze_experts()
     
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
@@ -580,13 +592,14 @@ def train_moe_phase3(model: MixtureOfExpertsModel,
             targets = targets.to(device)
             
             optimizer.zero_grad()
-            probs = model(sequences)
-            loss = criterion(probs, targets)
+            logits = model(sequences)
+            loss = criterion(logits, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item() * len(targets)
+            probs = torch.sigmoid(logits)
             preds = (probs >= 0.5).long()
             train_correct += (preds == targets.long()).sum().item()
             train_total += len(targets)
@@ -607,9 +620,10 @@ def train_moe_phase3(model: MixtureOfExpertsModel,
                 sequences = sequences.to(device)
                 targets = targets.to(device)
                 
-                probs = model(sequences)
-                loss = criterion(probs, targets)
+                logits = model(sequences)
+                loss = criterion(logits, targets)
                 val_loss += loss.item() * len(targets)
+                probs = torch.sigmoid(logits)
                 preds = (probs >= 0.5).long()
                 val_correct += (preds == targets.long()).sum().item()
                 val_total += len(targets)

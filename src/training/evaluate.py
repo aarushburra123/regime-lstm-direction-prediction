@@ -44,7 +44,8 @@ def evaluate_model(model: torch.nn.Module,
                 sequences, targets = batch
             
             sequences = sequences.to(device)
-            probs = model(sequences)
+            logits = model(sequences)
+            probs = torch.sigmoid(logits)
             
             all_probs.extend(probs.cpu().numpy())
             all_targets.extend(targets.numpy())
@@ -102,7 +103,8 @@ def evaluate_by_regime(model: torch.nn.Module,
             
             sequences, targets, regimes = batch
             sequences = sequences.to(device)
-            probs = model(sequences)
+            logits = model(sequences)
+            probs = torch.sigmoid(logits)
             
             all_probs.extend(probs.cpu().numpy())
             all_targets.extend(targets.numpy())
